@@ -1,6 +1,8 @@
 import logging
 import os
 from datetime import datetime
+from bson import binary
+from io import BytesIO
 
 from monty.json import jsanitize
 from monty.serialization import loadfn
@@ -78,7 +80,8 @@ class SurfaceBuilder(Builder):
         }
     """
 
-    def __init__(self, materials, surface, query=None, MAPI_KEY=None, **kwargs):
+    def __init__(self, materials, surface, wulff_images,
+                 query=None, MAPI_KEY=None, **kwargs):
         """
         Calculates surface properties for materials
 
@@ -86,16 +89,19 @@ class SurfaceBuilder(Builder):
             materials (Store): Store of task documents for the raw
                 calculations (via parsing with atomate's drone)
             surface (Store): Store of surface properties
+            wulff_images (Store): Store of images of the Wulff shape in
+                varying directions. Used primarily for website building.
             query (dict): dictionary to limit materials to be analyzed
         """
 
         self.materials = materials
         self.surface = surface
+        self.wulff_images = wulff_images
         self.query = query if query else {}
         self.mprester = MPRester(api_key=MAPI_KEY)
 
         super().__init__(sources=[materials],
-                         targets=[surface],
+                         targets=[surface, wulff_images],
                          **kwargs)
 
     def get_items(self):
@@ -155,9 +161,10 @@ class SurfaceBuilder(Builder):
         surface_entry["initial_structure"] = slab_task["initial_structure"]
         surface_entry["work_function"] = l - slab_outputs["efermi"]
 
-        # Get the surface properties for this material
+        # Get the surface propertiesand wulff shape images for this material
         el = ouc[0].species_string
         surfprops = self.get_material_surfprops(slab_task["material_id"], el)
+        wulffimages = self.get_material_surfprops(slab_task["material_id"], el)
 
         # Determine whether or not to include this termination in the collection
         surfprops = self.check_termination_stability(surfprops, surface_entry)
@@ -165,7 +172,10 @@ class SurfaceBuilder(Builder):
         # Get wulff shape related qunatities
         surfprops = self.get_wulff_surfprops(surfprops)
 
-        return surfprops
+        # Get images for the wulff shape
+        wulffimages = self.get_wulff_images(surfprops)
+
+        return surfprops, wulffimages
 
     def get_material_surfprops(self, mpid, el):
         """
@@ -193,7 +203,6 @@ class SurfaceBuilder(Builder):
 
                     self.logger.info("No surface properties for {}-{}. Creating new doc.".format(el, mpid))
                     self.surface.insert(surf_props)
-
                 break
 
         return surf_props
@@ -268,7 +277,13 @@ class SurfaceBuilder(Builder):
         conv = self.materials.find_one({"material_id": surfprops["material_id"],
                                         "structure_type": "conventional_unit_cell"})
         ucell = Structure.from_str(conv["initial_structure"], "cif")
-        return WulffShape(ucell.lattice, miller_list, e_surf_list)
+
+        try:
+            wulff_shape = WulffShape(ucell.lattice, miller_list, e_surf_list)
+        except RuntimeError:
+            wulff_shape = None
+
+        return wulff_shape
 
     def get_wulff_surfprops(self, surfprops):
         """
@@ -277,6 +292,12 @@ class SurfaceBuilder(Builder):
         """
 
         wulffshape = self.get_wulff_shape(surfprops)
+
+        if not wulffshape:
+            # if a wulffshape cannot be obtained because there are too few facets then
+            # skip this step and wait until there is enough data to get a Wulff shape.
+            return surfprops
+
         se = wulffshape.weighted_surface_energy
 
         area_frac_dict = wulffshape.area_fraction_dict
@@ -295,16 +316,57 @@ class SurfaceBuilder(Builder):
 
         return surfprops
 
-    def update_targets(self, surfprops):
+    def get_wulff_images(self, surfprops):
+
+        mpid = surfprops["material_id"]
+        wulffimages = self.wulff_images.find_one({"material_id": mpid})
+        if not wulffimages:
+            self.logger.info("No Wulff images for {}-{}. Creating new doc.".format( \
+                surfprops["pretty_formula"], mpid))
+
+            wulffimages = {"polymorph": surfprops["polymorph"], "hi_res_images": [],
+                           "pretty_formula": surfprops["pretty_formula"],
+                           "material_id": mpid, "spacegroup": surfprops["spacegroup"]}
+
+        wulffshape = self.get_wulff_shape(surfprops)
+        if not wulffshape:
+            return wulffimages
+
+        # Get the thumbnail for the periodic table of Wulff shapes
+        wulff_plot = wulff.get_plot(bar_on=False, legend_on=False)
+        data = BytesIO()
+        wulff_plot.savefig(data, transparent=True, dpi=30,
+                           bbox_inches='tight', pad_inches=-1.25)
+        wulff_plot.close()
+        wulffimages["thumbnail"] = binary.Binary(data.getvalue())
+
+        # Now get the hi-res images at different Miller indices
+        for hkl in wulffshape.miller_list:
+            image = {}
+            wulff_plot = wulff.get_plot(direction=hkl, bar_on=False,
+                                        legend_on=True)
+            data = BytesIO()
+            wulff_plot.savefig(data, transparent=True, dpi=100)
+            wulff_plot.close()
+            image["miller_index"] = hkl
+            image["image"] = binary.Binary(data.getvalue())
+            wulffimages["hi_res_images"].append(image)
+
+        return wulffimages
+
+    def update_targets(self, surfprops, wulffimages):
         """
         Make sure to insert the slab_cell task_id as an
         individual item to make querying for new entries easier?
         Also make sure this particular slab is the most stable
         one before inserting.
         """
-
-        self.logger.info("Updating {}-{} surface properties".format(surfprops["pretty_formula"],
-                                                                    surfprops["material_id"]))
-        self.surface.update_one({"material_id": surfprops["material_id"]},
+        el, mpid = surfprops["pretty_formula"], surfprops["material_id"]
+        self.logger.info("Updating {}-{} surface properties".format(el, mpid))
+        self.surface.update_one({"material_id": mpid},
                                 {"$set": surfprops})
+
+        self.logger.info("Updating {}-{} Wulff images".format(el, mpid))
+        self.wulff_images.update_one({"material_id": mpid},
+                                     {"$set": wulffimages})
 
