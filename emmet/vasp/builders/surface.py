@@ -191,7 +191,10 @@ class SurfaceBuilder(Builder):
                                                 "number": entry.data["spacegroup"]["number"]}
                     surf_props["surfaces"] = []
 
-                    break
+                    self.logger.info("No surface properties for {}-{}. Creating new doc.".format(el, mpid))
+                    self.surface.insert(surf_props)
+
+                break
 
         return surf_props
 
@@ -300,6 +303,8 @@ class SurfaceBuilder(Builder):
         one before inserting.
         """
 
+        self.logger.info("Updating {}-{} surface properties".format(surfprops["pretty_formula"],
+                                                                    surfprops["material_id"]))
+        self.surface.update_one({"material_id": surfprops["material_id"]},
+                                {"$set": surfprops})
 
-
-        pass
