@@ -116,15 +116,15 @@ class SurfaceBuilder(Builder):
         # self.logger.info("Setting indexes")
         # self.ensure_indexes()
 
-        q = {dict(self.query)}  # query criteria
+        q = dict(self.query)  # query criteria
         q["state"] = "successful"  # only find successfully completed calculations
         # only look for slab_cell calculations, because we need
         # a slab cell to actually process surface properties
         q["structure_type"] = "slab_cell"
-        f = self.materials.lu_filter(surfprops)
+        f = self.materials.lu_filter(self.surface)
         q.update(f)
 
-        mats = list(self.materials.distinct(materials.key, q))
+        mats = list(self.materials.distinct(self.materials.key, q))
         self.logger.info(
             "Found {} new slab calculations for {} materials".format(len(mats)))
 
@@ -148,7 +148,7 @@ class SurfaceBuilder(Builder):
         ouc = Structure.from_dict(ouc_outputs["structure"])
         ouc_entry = ComputedStructureEntry(ouc, ouc_outputs["energy"])
         se = slab_entry.surface_energy(ouc_entry)
-        l = max(slab_outputs["locpot"]["2"])
+        locpots = slab_outputs["locpot"]["2"]
 
         surface_entry["surface_energy"] = se * EV_PER_ANG2_TO_JOULES_PER_M2
         surface_entry["surface_energy_EV_PER_ANG2"] = se
@@ -159,7 +159,9 @@ class SurfaceBuilder(Builder):
         surface_entry["structure"] = s.to("cif")
         surface_entry["ouc_structure"] = ouc.to("cif")
         surface_entry["initial_structure"] = slab_task["initial_structure"]
-        surface_entry["work_function"] = l - slab_outputs["efermi"]
+        surface_entry["work_function"] = max(locpots) - slab_outputs["efermi"]
+        surface_entry["locpot_along_c"] = locpots
+
 
         # Get the surface propertiesand wulff shape images for this material
         el = ouc[0].species_string
@@ -222,7 +224,7 @@ class SurfaceBuilder(Builder):
         """
 
         surfaces = []
-        facetprops = surfprops["surfaces"]
+        facetprops = [surf for surf in surfprops["surfaces"]]
         se = propdoc["surface_energy"]
         # Do entries for this specific facet exist already?
         if not facetprops:
@@ -308,7 +310,7 @@ class SurfaceBuilder(Builder):
             surface["area_fraction"] = f
             weighted_work_function += f*surface["work_function"]
 
-        surfprops["weighted_work_function"] = weighted_work_function / wulffshape.surface_area
+        surfprops["weighted_work_function"] = weighted_work_function
         surfprops["shape_factor"] = wulffshape.shape_factor
         surfprops["weighted_surface_energy"] = se
         surfprops["weighted_surface_energy_EV_PER_ANG2"] = se/EV_PER_ANG2_TO_JOULES_PER_M2
